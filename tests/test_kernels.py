@@ -44,3 +44,39 @@ def test_page_salience_pooling():
     # Mean pooling: Page 0 -> 11/4 = 2.75; Page 1 -> 15/4 = 3.75
     paged_mean, num_pages = compute_page_salience_pool(salience, page_size=page_size, pool_type="mean")
     assert torch.allclose(paged_mean, torch.tensor([[2.75, 3.75]]))
+
+
+def test_triton_paged_sparse_attention_correctness():
+    """Verifies that paged sparse attention outputs match exact compacted SDPA reference."""
+    from razorkv.kernels.triton_paged_sparse import triton_paged_sparse_attention
+
+    batch_size = 2
+    num_heads = 4
+    num_kv_heads = 2
+    max_pages = 6
+    num_active = 3
+    page_size = 8
+    head_dim = 32
+
+    q = torch.randn(batch_size, num_heads, 1, head_dim)
+    k_paged = torch.randn(batch_size, num_kv_heads, max_pages, page_size, head_dim)
+    v_paged = torch.randn(batch_size, num_kv_heads, max_pages, page_size, head_dim)
+    page_table = torch.tensor([[0, 2, 4], [1, 3, 5]], dtype=torch.long)
+
+    out = triton_paged_sparse_attention(q, k_paged, v_paged, page_table)
+    assert out.shape == (batch_size, num_heads, 1, head_dim)
+
+    # Reference manual gather + SDPA
+    gathered_k = []
+    gathered_v = []
+    for b in range(batch_size):
+        pt = page_table[b]
+        k_b = k_paged[b, :, pt, :, :].reshape(num_kv_heads, num_active * page_size, head_dim)
+        v_b = v_paged[b, :, pt, :, :].reshape(num_kv_heads, num_active * page_size, head_dim)
+        gathered_k.append(k_b)
+        gathered_v.append(v_b)
+    ref_k = torch.stack(gathered_k, dim=0)
+    ref_v = torch.stack(gathered_v, dim=0)
+    ref_out = compacted_paged_sdpa(q, ref_k, ref_v)
+
+    assert torch.allclose(out, ref_out, atol=1e-5, rtol=1e-5)

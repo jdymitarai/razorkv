@@ -122,26 +122,20 @@ def triton_paged_sparse_attention(
         output: [batch_size, num_heads, 1, head_dim]
     """
     if not _TRITON_AVAILABLE or not query.is_cuda:
-        # Fallback to PyTorch gather + SDPA
+        # Vectorized pure PyTorch fallback using torch.gather + SDPA
         from razorkv.kernels.torch_sparse import compacted_paged_sdpa
         batch_size, num_heads, _, head_dim = query.shape
         _, num_kv_heads, _, page_size, _ = key_paged.shape
 
-        # Gather active pages into a compacted tensor
-        # page_table: [batch, num_active_pages]
         num_active = page_table.shape[1]
         active_tokens = num_active * page_size
-        gathered_k = []
-        gathered_v = []
-        for b in range(batch_size):
-            p_indices = page_table[b]
-            k_b = key_paged[b, :, p_indices, :, :].reshape(num_kv_heads, active_tokens, head_dim)
-            v_b = value_paged[b, :, p_indices, :, :].reshape(num_kv_heads, active_tokens, head_dim)
-            gathered_k.append(k_b)
-            gathered_v.append(v_b)
 
-        k_compact = torch.stack(gathered_k, dim=0)
-        v_compact = torch.stack(gathered_v, dim=0)
+        pt_expanded = page_table.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, num_kv_heads, page_size, head_dim)
+        k_sel = torch.gather(key_paged.permute(0, 2, 1, 3, 4), 1, pt_expanded)
+        v_sel = torch.gather(value_paged.permute(0, 2, 1, 3, 4), 1, pt_expanded)
+
+        k_compact = k_sel.permute(0, 2, 1, 3, 4).reshape(batch_size, num_kv_heads, active_tokens, head_dim)
+        v_compact = v_sel.permute(0, 2, 1, 3, 4).reshape(batch_size, num_kv_heads, active_tokens, head_dim)
         return compacted_paged_sdpa(query, k_compact, v_compact, scaling=scale)
 
     # Triton Execution Path

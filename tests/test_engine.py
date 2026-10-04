@@ -63,3 +63,45 @@ def test_engine_vram_savings_calculator():
     assert savings["dense_mb"] > 0
     assert savings["razorkv_mb"] < savings["dense_mb"]
     assert savings["saved_mb"] == savings["dense_mb"] - savings["razorkv_mb"]
+
+
+def test_engine_real_hf_model_patch_and_generate():
+    """Verifies that patch_model correctly wraps real HF generate, compresses cache, and unpatches."""
+    try:
+        from transformers import LlamaConfig, LlamaForCausalLM
+    except ImportError:
+        pytest.skip("transformers not installed")
+
+    cfg = LlamaConfig(
+        vocab_size=128,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        intermediate_size=128,
+        max_position_embeddings=2048,
+    )
+    model = LlamaForCausalLM(cfg)
+    model.eval()
+
+    # Patch model with RazorKV
+    razor_cfg = RazorConfig(compression_ratio=0.30, sink_tokens=8, local_window=16, page_size=4)
+    RazorEngine.patch_model(model, config=razor_cfg)
+
+    prompt = torch.randint(0, 128, (1, 80))
+    with torch.no_grad():
+        out = model.generate(prompt, max_new_tokens=10, eos_token_id=None, return_dict_in_generate=True)
+
+    assert out.sequences.shape[1] == 90
+    assert isinstance(out.past_key_values, RazorKVCache)
+    # Physical cache must be compressed
+    cached_len = out.past_key_values.get_cached_seq_length(0)
+    assert cached_len < 80, f"Cache was not compressed: {cached_len}"
+    assert out.past_key_values.seen_tokens >= 89
+
+    # Unpatch model and verify stock behavior returns
+    RazorEngine.unpatch_model(model)
+    with torch.no_grad():
+        out_unpatched = model.generate(prompt, max_new_tokens=2, return_dict_in_generate=True)
+
+    assert not isinstance(out_unpatched.past_key_values, RazorKVCache)

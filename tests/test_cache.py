@@ -66,12 +66,15 @@ def test_razor_cache_prefill_and_eviction():
         cache.update(k, v, layer_idx)
 
     # Check that eviction has occurred for shallow layer 0
-    layer0_len = cache.get_seq_length(0)
-    layer3_len = cache.get_seq_length(3)
+    layer0_cached = cache.get_cached_seq_length(0)
+    layer3_cached = cache.get_cached_seq_length(3)
 
-    assert layer0_len < prefill_len, f"Layer 0 was not compressed: len={layer0_len}"
-    assert layer0_len <= layer3_len, f"Layer 0 should have smaller or equal length to Layer 3: {layer0_len} vs {layer3_len}"
-    assert layer0_len >= sink_tokens + local_window
+    assert layer0_cached < prefill_len, f"Layer 0 was not compressed: len={layer0_cached}"
+    assert layer0_cached <= layer3_cached, f"Layer 0 should have smaller or equal length to Layer 3: {layer0_cached} vs {layer3_cached}"
+    assert layer0_cached >= sink_tokens + local_window
+    # RoPE position tracking must preserve full seen tokens
+    assert cache.get_seq_length(0) == prefill_len
+    assert cache.seen_tokens == prefill_len
 
 
 def test_razor_cache_autoregressive_decode():
@@ -94,7 +97,7 @@ def test_razor_cache_autoregressive_decode():
     cache.update(k_init, v_init, 0)
     cache.update(k_init, v_init, 1)
 
-    initial_len = cache.get_seq_length(0)
+    initial_cached = cache.get_cached_seq_length(0)
 
     # Autoregressive generation of 20 tokens
     for step in range(20):
@@ -103,11 +106,12 @@ def test_razor_cache_autoregressive_decode():
         cache.update(k_step, v_step, 0)
         cache.update(k_step, v_step, 1)
 
-    final_len = cache.get_seq_length(0)
+    final_cached = cache.get_cached_seq_length(0)
     # The cache length should remain bounded within budget + hysteresis
     max_expected = int(120 * 0.40) + config.page_size + (config.sink_tokens + config.local_window)
-    assert final_len <= max_expected
+    assert final_cached <= max_expected
     assert cache.seen_tokens == 120
+    assert cache.get_seq_length(0) == 120
 
 
 def test_razor_cache_sink_preservation():
@@ -161,6 +165,7 @@ def test_edge_case_sequence_shorter_than_window():
     cache.update(k, v, 0)
 
     # All 20 tokens must be retained
+    assert cache.get_cached_seq_length(0) == 20
     assert cache.get_seq_length(0) == 20
 
 
@@ -176,7 +181,8 @@ def test_multi_batch_handling():
 
     assert cache.key_cache[0].shape[0] == batch_size
     assert cache.value_cache[0].shape[0] == batch_size
-    assert cache.get_seq_length(0) < 80
+    assert cache.get_cached_seq_length(0) < 80
+    assert cache.get_seq_length(0) == 80
 
 
 def test_reorder_cache_for_beam_search():
@@ -194,4 +200,66 @@ def test_reorder_cache_for_beam_search():
     # First batch item should now have values from original index 1
     assert torch.allclose(cache.key_cache[0][0], k[1])
     assert torch.allclose(cache.value_cache[0][0], v[1])
+
+
+def test_cache_crop_and_reset():
+    """Verify crop and reset methods function cleanly."""
+    config = RazorConfig(sink_tokens=4, local_window=8, compression_ratio=0.5)
+    cache = RazorKVCache(config=config, num_layers=1)
+
+    k = torch.randn(1, 2, 20, 16)
+    v = torch.randn(1, 2, 20, 16)
+    cache.update(k, v, 0)
+
+    orig_cached = cache.get_cached_seq_length(0)
+    cache.crop(5)
+    assert cache.get_cached_seq_length(0) == orig_cached - 5
+    assert cache.seen_tokens == 15
+
+    cache.reset()
+    assert cache.seen_tokens == 0
+    assert cache.get_cached_seq_length(0) == 0
+    assert len(cache.key_cache) == 0
+
+
+def test_cache_batch_repeat_and_select():
+    """Verify batch_repeat_interleave and batch_select_indices."""
+    config = RazorConfig()
+    cache = RazorKVCache(config=config, num_layers=1)
+
+    k = torch.randn(2, 2, 10, 16)
+    v = torch.randn(2, 2, 10, 16)
+    cache.update(k, v, 0)
+
+    cache.batch_repeat_interleave(2)
+    assert cache.batch_size == 4
+
+    cache.batch_select_indices(torch.tensor([0, 2]))
+    assert cache.batch_size == 2
+
+
+def test_cache_get_mask_sizes_and_query_offset():
+    """Verify Transformers 5.x masking contracts."""
+    config = RazorConfig()
+    cache = RazorKVCache(config=config, num_layers=1)
+
+    # Before tokens are added
+    kv_len, kv_offset = cache.get_mask_sizes(10, 0)
+    assert kv_len == 10
+    assert kv_offset == 0
+    assert cache.get_query_offset(0) == 0
+
+    # After prefill
+    k = torch.randn(1, 2, 50, 16)
+    v = torch.randn(1, 2, 50, 16)
+    cache.update(k, v, 0)
+
+    # Decoding next token (q_len == 1)
+    kv_len, kv_offset = cache.get_mask_sizes(1, 0)
+    assert kv_len == cache.get_cached_seq_length(0) + 1
+    assert kv_offset == 0
+    assert cache.get_query_offset(0) == 50
+    assert cache.is_compileable is False
+    assert all(not s for s in cache.is_sliding)
+
 
